@@ -14,13 +14,8 @@
 # limitations under the License.
 
 name: "Micronaut Joint Validation Build"
-on:
-  push:
-    branches:
-      - GROOVY_4_0_X
-  pull_request:
-    branches:
-      - GROOVY_4_0_X
+on: [push, pull_request]
+
 jobs:
   build:
     strategy:
@@ -43,7 +38,7 @@ jobs:
 
       # Clone Micronaut Repos
       - name: Checkout Micronaut Core
-        run: cd .. && git clone --depth 1 https://github.com/micronaut-projects/micronaut-core -b 4.4.x
+        run: cd .. && git clone --depth 1 https://github.com/micronaut-projects/micronaut-core -b 4.6.x
 
       - name: Checkout Micronaut Groovy
         run: cd .. && git clone --depth 1 https://github.com/micronaut-projects/micronaut-groovy -b 4.1.x
