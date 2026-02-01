@@ -22,6 +22,7 @@ import org.apache.groovy.util.SystemUtil;
 import org.codehaus.groovy.runtime.memoize.MemoizeCache;
 
 import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.invoke.MutableCallSite;
 import java.lang.ref.SoftReference;
@@ -42,6 +43,8 @@ public class CacheableCallSite extends MutableCallSite {
     private final AtomicLong fallbackCount = new AtomicLong();
     private MethodHandle defaultTarget;
     private MethodHandle fallbackTarget;
+    private final MethodHandles.Lookup lookup;
+    private final Class<?> ownerClass;
     private final Map<String, SoftReference<MethodHandleWrapper>> lruCache =
             new LinkedHashMap<String, SoftReference<MethodHandleWrapper>>(INITIAL_CAPACITY, LOAD_FACTOR, true) {
                 private static final long serialVersionUID = 7785958879964294463L;
@@ -53,7 +56,33 @@ public class CacheableCallSite extends MutableCallSite {
             };
 
     public CacheableCallSite(MethodType type) {
+        this(type, null);
+    }
+
+    public CacheableCallSite(MethodType type, MethodHandles.Lookup lookup) {
         super(type);
+        this.lookup = lookup;
+        this.ownerClass = (lookup != null) ? lookup.lookupClass() : null;
+    }
+
+    /**
+     * Get the owner class of this call site (the class whose bytecode contains the invokedynamic instruction).
+     * Returns null if lookup was not provided (old constructor used).
+     */
+    public Class<?> getOwnerClass() {
+        return ownerClass;
+    }
+    
+    /**
+     * Get the lookup context for this call site. This lookup should be used for unreflect
+     * operations to ensure proper access control - the unreflected method handle will respect
+     * the caller's access permissions and Java module boundaries.
+     * 
+     * @return the lookup context, or null if not provided
+     * @see java.lang.invoke.MethodHandles.Lookup#unreflect(java.lang.reflect.Method)
+     */
+    public MethodHandles.Lookup getLookup() {
+        return lookup;
     }
 
     public MethodHandleWrapper getAndPut(String className, MemoizeCache.ValueProvider<? super String, ? extends MethodHandleWrapper> valueProvider) {
@@ -140,5 +169,24 @@ public class CacheableCallSite extends MutableCallSite {
         
         // Reset fallback count
         fallbackCount.set(0);
+    }
+    
+    /**
+     * Clear cache entries only for the specified class. Called when that
+     * class's metaclass changes, allowing cached handles for other classes
+     * to remain valid.
+     * 
+     * @param className the name of the class whose cache entries should be cleared
+     * @return true if an entry was removed, false otherwise
+     */
+    public boolean clearCacheForClass(String className) {
+        // Clear latest hit if it might be for this class
+        // (we clear it to be safe since we can't easily check the class)
+        latestHitMethodHandleWrapperSoftReference = null;
+        
+        // Remove only this class from cache
+        synchronized (lruCache) {
+            return lruCache.remove(className) != null;
+        }
     }
 }
