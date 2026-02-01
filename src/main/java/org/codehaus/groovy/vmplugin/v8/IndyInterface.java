@@ -19,6 +19,7 @@
 package org.codehaus.groovy.vmplugin.v8;
 
 import groovy.lang.GroovySystem;
+import groovy.lang.MetaClassRegistryChangeEvent;
 import org.apache.groovy.util.SystemUtil;
 import org.codehaus.groovy.GroovyBugError;
 import org.codehaus.groovy.reflection.ClassInfo;
@@ -186,7 +187,7 @@ public class IndyInterface {
     private static final Set<WeakReference<CacheableCallSite>> ALL_CALL_SITES = ConcurrentHashMap.newKeySet(INDY_CALLSITE_INITIAL_CAPACITY);
 
     static {
-        GroovySystem.getMetaClassRegistry().addMetaClassRegistryChangeEventListener(cmcu -> invalidateSwitchPoints());
+        GroovySystem.getMetaClassRegistry().addMetaClassRegistryChangeEventListener(IndyInterface::invalidateSwitchPoints);
     }
     
     /**
@@ -197,12 +198,23 @@ public class IndyInterface {
     }
 
     /**
-     * Callback for constant metaclass update change.
-     * Invalidates all call site caches to ensure metaclass changes are visible.
+     * Invalidate all call site caches. Called when no specific class context is available.
      */
     protected static void invalidateSwitchPoints() {
+        invalidateSwitchPoints(null);
+    }
+    
+    /**
+     * Callback for constant metaclass update change.
+     * Selectively invalidates call site caches based on receiver class for precise invalidation.
+     * Only clears cache entries for the changed class (receiver-based clearing).
+     */
+    protected static void invalidateSwitchPoints(MetaClassRegistryChangeEvent event) {
+        final Class<?> changedClass = event != null ? event.getClassToUpdate() : null;
+        final String changedClassName = changedClass != null ? changedClass.getName() : null;
+        
         if (LOG_ENABLED) {
-            LOG.info("invalidating switch point and call site caches");
+            LOG.info("invalidating switch point and call site caches for: " + changedClassName);
         }
 
         synchronized (IndyInterface.class) {
@@ -211,8 +223,8 @@ public class IndyInterface {
             SwitchPoint.invalidateAll(new SwitchPoint[]{old});
         }
         
-        // Invalidate all call site caches and reset targets to default (cache lookup)
-        // This ensures metaclass changes are visible without using expensive switchpoint guards
+        // Reset all call site targets to default (forces cache lookup on next call)
+        // but only clear cache entries for the changed class
         ALL_CALL_SITES.removeIf(ref -> {
             CacheableCallSite cs = ref.get();
             if (cs == null) {
@@ -223,8 +235,14 @@ public class IndyInterface {
             if (defaultTarget != null && cs.getTarget() != defaultTarget) {
                 cs.setTarget(defaultTarget);
             }
-            // Clear the cache so stale method handles are discarded
-            cs.clearCache();
+            // Only clear cache entries for the changed class (selective invalidation by RECEIVER class)
+            // This preserves cached handles for unrelated classes
+            if (changedClassName != null) {
+                cs.clearCacheForClass(changedClassName);
+            } else {
+                // If no class specified, fall back to clearing everything
+                cs.clearCache();
+            }
             return false;
         });
     }
@@ -265,7 +283,7 @@ public class IndyInterface {
         // we produce first a dummy call site, which then changes the target to one when INDY_OPTIMIZE_THRESHOLD is reached,
         // that does the method selection including the direct call to the
         // real method.
-        CacheableCallSite mc = new CacheableCallSite(type);
+        CacheableCallSite mc = new CacheableCallSite(type, caller);
         final Class<?> sender = caller.lookupClass();
         MethodHandle mh = makeAdapter(mc, sender, name, callID, type, safe, thisCall, spreadCall);
         mc.setTarget(mh);
@@ -298,7 +316,7 @@ public class IndyInterface {
     }
 
     private static class FallbackSupplier {
-        private final MutableCallSite callSite;
+        private final CacheableCallSite callSite;
         private final Class<?> sender;
         private final String methodName;
         private final int callID;
@@ -309,7 +327,7 @@ public class IndyInterface {
         private final Object[] arguments;
         private MethodHandleWrapper result;
 
-        FallbackSupplier(MutableCallSite callSite, Class<?> sender, String methodName, int callID, Boolean safeNavigation, Boolean thisCall, Boolean spreadCall, Object dummyReceiver, Object[] arguments) {
+        FallbackSupplier(CacheableCallSite callSite, Class<?> sender, String methodName, int callID, Boolean safeNavigation, Boolean thisCall, Boolean spreadCall, Object dummyReceiver, Object[] arguments) {
             this.callSite = callSite;
             this.sender = sender;
             this.methodName = methodName;
@@ -334,16 +352,18 @@ public class IndyInterface {
      * Get the cached methodhandle. if the related methodhandle is not found in the inline cache, cache and return it.
      */
     public static Object fromCache(MutableCallSite callSite, Class<?> sender, String methodName, int callID, Boolean safeNavigation, Boolean thisCall, Boolean spreadCall, Object dummyReceiver, Object[] arguments) throws Throwable {
-        FallbackSupplier fallbackSupplier = new FallbackSupplier(callSite, sender, methodName, callID, safeNavigation, thisCall, spreadCall, dummyReceiver, arguments);
+        // Cast is safe because bootstrap always creates CacheableCallSite
+        CacheableCallSite ccs = (CacheableCallSite) callSite;
+        FallbackSupplier fallbackSupplier = new FallbackSupplier(ccs, sender, methodName, callID, safeNavigation, thisCall, spreadCall, dummyReceiver, arguments);
 
         MethodHandleWrapper mhw =
                 bypassCache(spreadCall, arguments)
                     ? NULL_METHOD_HANDLE_WRAPPER
                     : doWithCallSite(
-                            callSite, arguments,
-                            (cs, receiver) ->
+                            ccs, arguments, callID,
+                            (cs, cacheKey) ->
                                     cs.getAndPut(
-                                            receiver.getClass().getName(),
+                                            cacheKey,
                                             c -> {
                                                 MethodHandleWrapper fbMhw = fallbackSupplier.get();
                                                 return fbMhw.isCanSetTarget() ? fbMhw : NULL_METHOD_HANDLE_WRAPPER;
@@ -355,8 +375,8 @@ public class IndyInterface {
             mhw = fallbackSupplier.get();
         }
 
-        if (mhw.isCanSetTarget() && (callSite.getTarget() != mhw.getTargetMethodHandle()) && (mhw.getLatestHitCount() > INDY_OPTIMIZE_THRESHOLD)) {
-            callSite.setTarget(mhw.getTargetMethodHandle());
+        if (mhw.isCanSetTarget() && (ccs.getTarget() != mhw.getTargetMethodHandle()) && (mhw.getLatestHitCount() > INDY_OPTIMIZE_THRESHOLD)) {
+            ccs.setTarget(mhw.getTargetMethodHandle());
             if (LOG_ENABLED) LOG.info("call site target set, preparing outside invocation");
 
             mhw.resetLatestHitCount();
@@ -375,31 +395,29 @@ public class IndyInterface {
      * Core method for indy method selection using runtime types.
      */
     public static Object selectMethod(MutableCallSite callSite, Class<?> sender, String methodName, int callID, Boolean safeNavigation, Boolean thisCall, Boolean spreadCall, Object dummyReceiver, Object[] arguments) throws Throwable {
-        final MethodHandleWrapper mhw = fallback(callSite, sender, methodName, callID, safeNavigation, thisCall, spreadCall, dummyReceiver, arguments);
+        // Cast is safe because bootstrap always creates CacheableCallSite
+        CacheableCallSite ccs = (CacheableCallSite) callSite;
+        final MethodHandleWrapper mhw = fallback(ccs, sender, methodName, callID, safeNavigation, thisCall, spreadCall, dummyReceiver, arguments);
 
-        if (callSite instanceof CacheableCallSite) {
-            CacheableCallSite cacheableCallSite = (CacheableCallSite) callSite;
+        final MethodHandle defaultTarget = ccs.getDefaultTarget();
+        final long fallbackCount = ccs.incrementFallbackCount();
+        if ((fallbackCount > INDY_FALLBACK_THRESHOLD) && (ccs.getTarget() != defaultTarget)) {
+            ccs.setTarget(defaultTarget);
+            if (LOG_ENABLED) LOG.info("call site target reset to default, preparing outside invocation");
 
-            final MethodHandle defaultTarget = cacheableCallSite.getDefaultTarget();
-            final long fallbackCount = cacheableCallSite.incrementFallbackCount();
-            if ((fallbackCount > INDY_FALLBACK_THRESHOLD) && (cacheableCallSite.getTarget() != defaultTarget)) {
-                cacheableCallSite.setTarget(defaultTarget);
-                if (LOG_ENABLED) LOG.info("call site target reset to default, preparing outside invocation");
+            ccs.resetFallbackCount();
+        }
 
-                cacheableCallSite.resetFallbackCount();
-            }
-
-            if (defaultTarget == cacheableCallSite.getTarget()) {
-                // correct the stale methodhandle in the inline cache of callsite
-                // it is important but impacts the performance somehow when cache misses frequently
-                doWithCallSite(callSite, arguments, (cs, receiver) -> cs.put(receiver.getClass().getName(), mhw));
-            }
+        if (defaultTarget == ccs.getTarget()) {
+            // correct the stale methodhandle in the inline cache of callsite
+            // it is important but impacts the performance somehow when cache misses frequently
+            doWithCallSite(ccs, arguments, callID, (cs, cacheKey) -> cs.put(cacheKey, mhw));
         }
 
         return mhw.getCachedMethodHandle().invokeExact(arguments);
     }
 
-    private static MethodHandleWrapper fallback(MutableCallSite callSite, Class<?> sender, String methodName, int callID, Boolean safeNavigation, Boolean thisCall, Boolean spreadCall, Object dummyReceiver, Object[] arguments) {
+    private static MethodHandleWrapper fallback(CacheableCallSite callSite, Class<?> sender, String methodName, int callID, Boolean safeNavigation, Boolean thisCall, Boolean spreadCall, Object dummyReceiver, Object[] arguments) {
         Selector selector = Selector.getSelector(callSite, sender, methodName, callID, safeNavigation, thisCall, spreadCall, arguments);
         selector.setCallSiteTarget();
 
@@ -410,17 +428,40 @@ public class IndyInterface {
         );
     }
 
-    private static <T> T doWithCallSite(MutableCallSite callSite, Object[] arguments, BiFunction<? super CacheableCallSite, ? super Object, ? extends T> f) {
-        if (callSite instanceof CacheableCallSite) {
-            CacheableCallSite cacheableCallSite = (CacheableCallSite) callSite;
-            Object receiver = arguments[0];
+    /**
+     * Helper method to execute a function with a call site and compute the appropriate cache key.
+     * 
+     * <p>When the receiver is a Class object (which happens for constructor calls, static method calls,
+     * and static property access), we use that Class's name as the cache key. This ensures that when
+     * a class's metaclass changes, the cache entries for that class are properly invalidated.</p>
+     * 
+     * <p>For example, both {@code new Foo()} and {@code Foo.staticMethod()} have a Class object as
+     * receiver, and both should have cache key "Foo" so that changing Foo's metaclass invalidates
+     * both cached method handles.</p>
+     * 
+     * @param callSite the call site
+     * @param arguments the call arguments (receiver is at index 0)
+     * @param callID the call type ordinal (unused but kept for API consistency)
+     * @param f the function to execute, receiving (callSite, cacheKey)
+     * @return the result of the function
+     */
+    private static <T> T doWithCallSite(CacheableCallSite callSite, Object[] arguments, int callID, BiFunction<? super CacheableCallSite, ? super String, ? extends T> f) {
+        Object receiver = arguments[0];
 
-            if (null == receiver) receiver = NullObject.getNullObject();
+        if (null == receiver) receiver = NullObject.getNullObject();
 
-            return f.apply(cacheableCallSite, receiver);
+        // Compute cache key:
+        // - For Class receivers (static calls, constructors), use the Class's name
+        // - For instance receivers, use the instance's class name
+        // This ensures metaclass changes invalidate the right cache entries
+        final String cacheKey;
+        if (receiver instanceof Class) {
+            cacheKey = ((Class<?>) receiver).getName();
+        } else {
+            cacheKey = receiver.getClass().getName();
         }
 
-        throw new GroovyBugError("CacheableCallSite is expected, but the actual callsite is: " + callSite);
+        return f.apply(callSite, cacheKey);
     }
 
     /**

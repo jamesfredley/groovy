@@ -58,7 +58,7 @@ import org.codehaus.groovy.vmplugin.VMPluginFactory;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
-import java.lang.invoke.MutableCallSite;
+
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -110,7 +110,7 @@ public abstract class Selector {
     public String name;
     public MethodHandle handle;
     public boolean useMetaClass = false, cache = true;
-    public MutableCallSite callSite;
+    public CacheableCallSite callSite;
     public Class<?> sender;
     public boolean isVargs;
     public boolean safeNavigation, safeNavigationOrig, spread;
@@ -135,7 +135,7 @@ public abstract class Selector {
     /**
      * Returns the Selector
      */
-    public static Selector getSelector(MutableCallSite callSite, Class<?> sender, String methodName, int callID, boolean safeNavigation, boolean thisCall, boolean spreadCall, Object[] arguments) {
+    public static Selector getSelector(CacheableCallSite callSite, Class<?> sender, String methodName, int callID, boolean safeNavigation, boolean thisCall, boolean spreadCall, Object[] arguments) {
         CallType callType = CALL_TYPE_VALUES[callID];
         switch (callType) {
             case INIT:
@@ -154,6 +154,18 @@ public abstract class Selector {
     }
 
     abstract void setCallSiteTarget();
+    
+    /**
+     * Get the lookup context for unreflect operations. Uses the call site's lookup
+     * (which respects the caller's access permissions) if available, otherwise
+     * falls back to the static LOOKUP.
+     * 
+     * @return the lookup context to use for unreflect operations
+     */
+    protected MethodHandles.Lookup getLookup() {
+        MethodHandles.Lookup lookup = callSite != null ? callSite.getLookup() : null;
+        return lookup != null ? lookup : LOOKUP;
+    }
 
     /**
      * Helper method to transform the given arguments, consisting of the receiver
@@ -186,7 +198,7 @@ public abstract class Selector {
     private static class CastSelector extends MethodSelector {
         private final Class<?> staticSourceType, staticTargetType;
 
-        public CastSelector(MutableCallSite callSite, Object[] arguments) {
+        public CastSelector(CacheableCallSite callSite, Object[] arguments) {
             super(callSite, Selector.class, "", CallType.CAST, Boolean.FALSE, Boolean.FALSE, Boolean.FALSE, arguments);
             this.staticSourceType = callSite.type().parameterType(0);
             this.staticTargetType = callSite.type().returnType();
@@ -305,7 +317,7 @@ public abstract class Selector {
     private static class PropertySelector extends MethodSelector {
         private boolean insertName = false;
 
-        public PropertySelector(MutableCallSite callSite, Class<?> sender, String methodName, CallType callType, boolean safeNavigation, boolean thisCall, boolean spreadCall, Object[] arguments) {
+        public PropertySelector(CacheableCallSite callSite, Class<?> sender, String methodName, CallType callType, boolean safeNavigation, boolean thisCall, boolean spreadCall, Object[] arguments) {
             super(callSite, sender, methodName, callType, safeNavigation, thisCall, spreadCall, arguments);
         }
 
@@ -354,7 +366,7 @@ public abstract class Selector {
                 CachedField cf = (CachedField) res;
                 Field f = cf.getCachedField();
                 try {
-                    handle = LOOKUP.unreflectGetter(f);
+                    handle = getLookup().unreflectGetter(f);
                     if (Modifier.isStatic(f.getModifiers())) {
                         // normally we would do the following
                         // handle = MethodHandles.dropArguments(handle,0,Class.class);
@@ -407,7 +419,7 @@ public abstract class Selector {
         private static final MethodType MT_OBJECT = MethodType.methodType(Object.class);
         private boolean beanConstructor;
 
-        public InitSelector(MutableCallSite callSite, Class<?> sender, String methodName, CallType callType, boolean safeNavigation, boolean thisCall, boolean spreadCall, Object[] arguments) {
+        public InitSelector(CacheableCallSite callSite, Class<?> sender, String methodName, CallType callType, boolean safeNavigation, boolean thisCall, boolean spreadCall, Object[] arguments) {
             super(callSite, sender, methodName, callType, safeNavigation, thisCall, spreadCall, arguments);
         }
 
@@ -459,7 +471,7 @@ public abstract class Selector {
                 isVargs = mc.isVargsMethod();
                 Constructor con = mc.getCachedConstrcutor().getCachedConstructor();
                 try {
-                    handle = LOOKUP.unreflectConstructor(con);
+                    handle = getLookup().unreflectConstructor(con);
                     if (LOG_ENABLED) LOG.info("successfully unreflected constructor");
                 } catch (IllegalAccessException e) {
                     throw new GroovyBugError(e);
@@ -532,7 +544,7 @@ public abstract class Selector {
         private boolean isCategoryMethod;
         protected MetaClass mc;
 
-        public MethodSelector(MutableCallSite callSite, Class<?> sender, String methodName, CallType callType, Boolean safeNavigation, Boolean thisCall, Boolean spreadCall, Object[] arguments) {
+        public MethodSelector(CacheableCallSite callSite, Class<?> sender, String methodName, CallType callType, Boolean safeNavigation, Boolean thisCall, Boolean spreadCall, Object[] arguments) {
             this.callType = callType;
             this.targetType = callSite.type();
             this.name = methodName;
@@ -707,7 +719,7 @@ public abstract class Selector {
                 return ObjectUtil.getCloneObjectMethodHandle();
             }
 
-            return LOOKUP.unreflect(m);
+            return getLookup().unreflect(m);
         }
 
         /**
